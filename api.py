@@ -2,20 +2,27 @@ import os
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from app.models import Covenant, Financials
+from pydantic import BaseModel
+
+# Internal modules
+from app.models import Covenant, Financials, EvaluationRequest
 from app.engine import evaluate_covenant
 from app.scoring import aggregate_risk
 from app.db_utils import get_db
 from app.db_models import Evaluation, CovenantResult, User
-from app.reports import generate_pdf
+from app.reports import generate_pdf, generate_excel
 from app.logger import logger
 from app.auth_models import UserCreate, UserLogin
 from app.security import hash_password, verify_password
 from app.token import create_access_token
 from app.auth_dependency import get_current_user
-from app.models import EvaluationRequest
+from app.intake import intake_spreadsheet  # Consolidated import
 
 router = APIRouter()
+
+# Request Model for Excel Intake
+class ExcelIntakeRequest(BaseModel):
+    file_path: str
 
 # =========================================================
 # AUTH ROUTES (PUBLIC)
@@ -63,6 +70,7 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
 # =========================================================
 # CORE BUSINESS ROUTES (PROTECTED)
 # =========================================================
+
 @router.post("/evaluate")
 def evaluate(
     payload: EvaluationRequest,
@@ -116,6 +124,26 @@ def evaluate(
         db.rollback()
         logger.exception("Evaluation failed")
         raise HTTPException(status_code=400, detail=f"Evaluation failed: {str(e)}")
+
+# =========================================================
+# DATA INTAKE (PROTECTED)
+# =========================================================
+
+@router.post("/intake/excel")
+def excel_intake(
+    req: ExcelIntakeRequest,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Parses an Excel file via the 'intake' module and returns the extracted data
+    structure so the frontend can review it before submitting an evaluation.
+    """
+    # Optional: Add role check here if needed
+    try:
+        return intake_spreadsheet(req.file_path)
+    except Exception as e:
+        logger.error(f"Excel intake failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 # =========================================================
 # HISTORY & AUDIT (PROTECTED)
@@ -209,4 +237,40 @@ def pdf_report(
         path=file_path,
         media_type="application/pdf",
         filename=file_path
+    )
+
+@router.get("/evaluations/{evaluation_id}/report/excel")
+def excel_report(
+    evaluation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    evaluation = db.query(Evaluation).filter(
+        Evaluation.id == evaluation_id
+    ).first()
+
+    if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    results = [
+        {
+            "covenant_name": r.covenant_name,
+            "metric": r.metric,
+            "value": r.value,
+            "status": r.status
+        }
+        for r in evaluation.results
+    ]
+
+    file_path = generate_excel(
+        evaluation.id,
+        evaluation.period,
+        evaluation.overall_risk,
+        results
+    )
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"Covenant_Report_{evaluation.id}.xlsx"
     )
